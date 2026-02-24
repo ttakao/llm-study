@@ -2,15 +2,24 @@
 from mcp.server.fastmcp import FastMCP
 from datetime import datetime
 
-#1 MCPサーバーインスタンス
+# サーバーに名前をつけます
 mcp = FastMCP("Yuki-Clock")
 
-#2 Toolの登録
+# --- ツール1: 日付のみ ---
+@mcp.tool()
+def get_current_date() -> str:
+    """現在の日付（年・月・日）のみを取得します。
+    曜日は含まれません。今日が何日か知りたい時に使います。"""
+    now = datetime.now()
+    return now.strftime("%Y年%m月%d日")
+
+# --- ツール2: 時刻のみ ---
 @mcp.tool()
 def get_current_time() -> str:
-    """現在の日時を[YYYY年MM月DD日 HH時MM分SS]の形式で返します"""
+    """現在の時刻（時・分・秒）のみを取得します。
+    日付の情報は含まれません。今が何時か知りたい時に使います。"""
     now = datetime.now()
-    return now.strftime("%Y年%m月%d日 %H時%M分%S秒")
-    
+    return now.strftime("%H時%M分%S秒")
+
 if __name__ == "__main__":
     mcp.run()
