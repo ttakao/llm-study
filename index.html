@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Ollama Console v3.7</title>
+    <style>
+        html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; background: #1e1e1e; color: #d4d4d4; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; max-width: 900px; margin: 0 auto; }
+        .header-container { display: flex; align-items: baseline; gap: 10px; margin: 10px 15px; flex-shrink: 0; }
+        h1 { font-size: 1.1rem; color: #007acc; margin: 0; font-weight: normal; letter-spacing: 1px; }
+        .version-badge { font-size: 0.7rem; color: #666; font-family: 'Consolas', monospace; }
+        .settings { display: flex; gap: 8px; margin: 0 10px 10px 10px; padding: 10px; background: #252526; border-radius: 8px; align-items: center; border: 1px solid #333; flex-shrink: 0; flex-wrap: wrap; }
+        .settings input, .settings select { flex: 1; min-width: 120px; font-size: 14px; background: #3c3c3c; color: white; border: 1px solid #555; padding: 8px; border-radius: 4px; }
+        .settings button { padding: 8px 12px; background: #444; color: #ccc; border: none; border-radius: 4px; cursor: pointer; }
+        .info-tag { font-size: 0.75rem; color: #888; margin: 0 15px 5px 15px; flex-shrink: 0; }
+        #debugPanel { font-size: 0.65rem; color: #4ec9b0; background: #000; padding: 10px; border: 1px solid #333; margin: 0 10px 5px 10px; display: none; overflow-x: auto; white-space: pre-wrap; }
+        #chat { flex-grow: 1; overflow-y: auto; border: 1px solid #333; padding: 15px; background: #0d0d0d; border-radius: 8px; white-space: pre-wrap; line-height: 1.6; margin: 0 10px 10px 10px; display: flex; flex-direction: column; }
+        .message-row { display: flex; margin-bottom: 15px; width: 100%; }
+        .user-row { justify-content: flex-end; }
+        .ai-row { justify-content: flex-start; }
+        .message-bubble { max-width: 85%; padding: 12px 16px; border-radius: 18px; font-size: 1rem; word-wrap: break-word; }
+        .user-bubble { background: #264f78; color: #e0e0e0; border-bottom-right-radius: 2px; }
+        .ai-bubble { background: #2d2d2d; color: #ce9178; border-bottom-left-radius: 2px; }
+        .input-area { display: flex; gap: 8px; padding: 10px; background: #1e1e1e; border-top: 1px solid #333; flex-shrink: 0; }
+        #userInput { flex-grow: 1; font-size: 16px; background: #3c3c3c; color: white; border: 1px solid #555; padding: 12px; border-radius: 8px; outline: none; }
+        #sendBtn { background: #0e639c; color: white; border: none; min-width: 70px; font-weight: bold; cursor: pointer; border-radius: 8px; }
+        #sendBtn.stop { background: #a31515; }
+        @media (max-width: 600px) { .settings { flex-direction: column; align-items: stretch; } .header-container { justify-content: center; } }
+    </style>
+</head>
+<body>
+    <div class="header-container">
+        <h1>Ollama Web Console</h1>
+        <span class="version-badge">v3.7 (Param support)</span>
+    </div>
+
+    <div class="settings">
+        <input type="text" id="baseUrl" value="http://localhost:8001" placeholder="Server URL">
+        
+        <input type="text" id="personaFile" value="" placeholder="Persona (.txt)">
+
+        <select id="modelSelect" onchange="loadModelConfig()"><option value="">Modelを選択</option></select>
+        <div style="display:flex; gap:5px; width:100%;">
+            <button onclick="fetchModels()" style="flex:1;">同期</button>
+            <button onclick="toggleDebug()" style="font-size:0.6rem;">DEBUG</button>
+        </div>
+    </div>
+
+    <div id="statusInfo" class="info-tag">Ready</div>
+    <div id="debugPanel"></div>
+    <div id="chat"></div>
+
+    <div class="input-area">
+        <input type="text" id="userInput" placeholder="メッセージ..." autocomplete="off">
+        <button id="sendBtn" onclick="handleAction()">送信</button>
+    </div>
+
+    <script>
+        var messages = []; 
+        var currentSystemPrompt = "";
+        var currentModelOptions = {};
+        var abortController = null;
+        var MAX_HISTORY = 20;
+        var ALLOWED_OPTIONS = ['num_ctx', 'temperature', 'top_k', 'top_p', 'repeat_penalty', 'repeat_last_n', 'seed', 'num_predict', 'stop', 'tfs_z', 'typical_p', 'presence_penalty', 'frequency_penalty', 'mirostat', 'mirostat_tau', 'mirostat_eta', 'num_thread'];
+
+        window.toggleDebug = function() {
+            var p = document.getElementById('debugPanel');
+            p.style.display = p.style.display === 'none' ? 'block' : 'none';
+        };
+
+        window.parseParameters = function(paramString) {
+            var params = {};
+            if (!paramString) return params;
+            var lines = paramString.split('\n');
+            for (var i = 0; i < lines.length; i++) {
+                var parts = lines[i].trim().split(/\s+/);
+                if (parts.length >= 2) {
+                    var key = parts[0];
+                    var val = parts.slice(1).join(' ').replace(/^"|"$/g, '');
+                    if (ALLOWED_OPTIONS.indexOf(key) === -1) continue;
+                    if (key === 'stop') {
+                        if (!params[key]) params[key] = [];
+                        params[key].push(val);
+                        continue;
+                    }
+                    if (val.toLowerCase() === "true") val = true;
+                    else if (val.toLowerCase() === "false") val = false;
+                    else if (/^-?\d+$/.test(val)) val = parseInt(val, 10);
+                    else if (/^-?\d*\.\d+$/.test(val)) val = parseFloat(val);
+                    params[key] = val;
+                }
+            }
+            return params;
+        };
+
+        window.fetchModels = async function() {
+            var baseUrl = document.getElementById('baseUrl').value.replace(/\/$/, ""); // 末尾スラッシュ除去
+            var statusInfo = document.getElementById('statusInfo');
+            try {
+                statusInfo.textContent = "同期中...";
+                var res = await fetch(baseUrl + "/api/tags");
+                if (!res.ok) throw new Error("HTTP " + res.status);
+                var data = await res.json();
+                var select = document.getElementById('modelSelect');
+                select.innerHTML = data.models.map(function(m) { return '<option value="' + m.name + '">' + m.name + '</option>'; }).join('');
+                statusInfo.textContent = "同期完了";
+                window.loadModelConfig();
+            } catch (e) {
+                statusInfo.textContent = "接続エラー: " + e.message;
+            }
+        };
+
+        window.loadModelConfig = async function() {
+            var baseUrl = document.getElementById('baseUrl').value.replace(/\/$/, "");
+            var model = document.getElementById('modelSelect').value;
+            if(!model) return;
+            try {
+                var res = await fetch(baseUrl + "/api/show", {
+                    method: 'POST',
+                    body: JSON.stringify({ name: model })
+                });
+                var data = await res.json();
+                currentSystemPrompt = data.system || "";
+                currentModelOptions = window.parseParameters(data.parameters);
+                document.getElementById('debugPanel').textContent = "Model: " + model + "\nOptions: " + JSON.stringify(currentModelOptions, null, 2);
+                messages = currentSystemPrompt ? [{ role: 'system', content: currentSystemPrompt }] : [];
+                document.getElementById('chat').innerHTML = "<div style='color:#555; font-size:0.75rem; text-align:center;'>--- [" + model + "] Session Started ---</div>";
+            } catch (e) { console.error(e); }
+        };
+
+        window.handleAction = function() {
+            var btn = document.getElementById('sendBtn');
+            if (btn.classList.contains('stop')) {
+                if (abortController) abortController.abort();
+            } else {
+                window.send();
+            }
+        };
+
+        window.send = async function() {
+            var baseUrl = document.getElementById('baseUrl').value.replace(/\/$/, "");
+            var persona = document.getElementById('personaFile').value.trim();
+            var userInput = document.getElementById('userInput');
+            var model = document.getElementById('modelSelect').value;
+            var text = userInput.value.trim();
+            if (!text || !model) return;
+
+            userInput.value = "";
+            messages.push({ role: 'user', content: text });
+            window.appendDisplay(text, "user");
+
+            while (messages.length > MAX_HISTORY + 1) { messages.splice(1, 1); }
+
+            var aiMsgDiv = window.appendDisplay("", "ai");
+            var btn = document.getElementById('sendBtn');
+            btn.textContent = "停止"; btn.classList.add('stop');
+            abortController = new AbortController();
+
+            try {
+                // 【核心部】チャット送信時だけ、URLにパラメーターを付加する
+                var chatUrl = baseUrl + "/api/chat";
+                if (persona) {
+                    chatUrl += "?persona=" + encodeURIComponent(persona);
+                }
+
+                var response = await fetch(chatUrl, {
+                    method: 'POST',
+                    body: JSON.stringify({ model: model, messages: messages, stream: true, options: currentModelOptions }),
+                    signal: abortController.signal
+                });
+
+                if (!response.ok) throw new Error(await response.text());
+
+                var reader = response.body.getReader();
+                var decoder = new TextDecoder();
+                var fullAiReply = "";
+
+                while (true) {
+                    var r = await reader.read();
+                    if (r.done) break;
+                    var chunk = decoder.decode(r.value);
+                    var lines = chunk.split('\n');
+                    for (var i = 0; i < lines.length; i++) {
+                        if (!lines[i].trim()) continue;
+                        try {
+                            var json = JSON.parse(lines[i]);
+                            if (json.message && json.message.content) {
+                                fullAiReply += json.message.content;
+                                aiMsgDiv.textContent += json.message.content;
+                                document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
+                            }
+                        } catch(err) { }
+                    }
+                }
+                messages.push({ role: 'assistant', content: fullAiReply });
+            } catch (e) {
+                aiMsgDiv.textContent += (e.name === 'AbortError') ? "\n[中断]" : "\n[Error: " + e.message + "]";
+            } finally {
+                btn.textContent = "送信"; btn.classList.remove('stop');
+                abortController = null; userInput.focus();
+            }
+        };
+
+        window.appendDisplay = function(text, role) {
+            var chat = document.getElementById('chat');
+            var row = document.createElement('div');
+            row.className = 'message-row ' + role + '-row';
+            var bubble = document.createElement('div');
+            bubble.className = 'message-bubble ' + role + '-bubble';
+            var content = document.createElement('span');
+            content.textContent = text;
+            bubble.appendChild(content);
+            row.appendChild(bubble);
+            chat.appendChild(row);
+            chat.scrollTop = chat.scrollHeight;
+            return content;
+        };
+
+        document.getElementById('userInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') window.handleAction();
+        });
+
+        window.onload = function() {
+            window.fetchModels();
+        };
+    </script>
+</body>
+</html>
